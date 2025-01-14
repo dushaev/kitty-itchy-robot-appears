@@ -13,6 +13,9 @@ String ESP_UID;
 // Переменные для таймера
 unsigned long lastTime = 0;
 unsigned long timerDelay = 30000;
+#include "VolAnalyzer.h"
+uint64_t t;
+bool sound_waiting = 0;
 
 #ifdef ESP8266
 #include <ESP8266WiFi.h>
@@ -21,8 +24,9 @@ unsigned long timerDelay = 30000;
 Ticker blinker;
 #define BTN_PIN D6
 #define SOUND_PIN D5
-#define PIN_SENSOR D1  // Пин, к которому присоединен датчик вибрации
-#define PIN_MIC A0     // Пин, к которому присоединен микрофон
+#define PIN_SENSOR D1   // Пин, к которому присоединен датчик вибрации
+#define PIN_MIC A0      // Пин, к которому присоединен микрофон
+#define PIN_MIC_DGT D8  //для прерывания
 char packetBuffer[UDP_TX_PACKET_MAX_SIZE + 1];
 WiFiUDP udp;
 #endif
@@ -43,15 +47,19 @@ int beacon_answered_count = 0;  // количество маяков, отпра
 int connections = 0;
 #define BTN_PIN 17
 #define SOUND_PIN 16
-#define PIN_SENSOR 4  // Пин, к которому присоединен датчик вибрации
-#define PIN_MIC 32    // Пин, к которому присоединен микрофон
-#define PIN_SDA 27    // Дисплей SDA
-#define PIN_SCK 14    // Дисплей SCK
+#define PIN_SENSOR 4    // Пин, к которому присоединен датчик вибрации
+#define PIN_MIC 32      // Пин, к которому присоединен микрофон
+#define PIN_MIC_DGT 21  //для прерывания
+#define PIN_SDA 27      // Дисплей SDA
+#define PIN_SCK 14      // Дисплей SCK
 AsyncUDP udp;
+WiFiUDP udp2;
 // Массив для хранения данных от устройств
 uint64_t deviceData[NUM_BEACON];  // [deviceIndex][dataIndex]
 uint64_t serverData = 0;
 hw_timer_t *timer = NULL;
+uint64_t lastSoundTime;
+bool calculating_robot_coords = 0;
 #endif
 
 #define DO_MAKE_SOUND 2               //издать звук
@@ -61,6 +69,8 @@ hw_timer_t *timer = NULL;
 #define SET_STATUS_IDLE 6             //статус бездействие
 #define COMMAND_RECEIVED 7            //команда полученао подключение к wifi сервера
 #define SET_STATUS_WAIT_FOR_SIGNAL 1  //ожидание звука
+
+VolAnalyzer analyzer(PIN_MIC);
 
 #ifdef ESP8266
 boolean wifi_connect_started = false;  //запущен
@@ -90,8 +100,6 @@ void showConnectionsCount() {
   char data[32];
   sprintf(data, "B: %d", connections);
   draw_message(data);
-//Serial.print("connections=");
-//Serial.println(WiFi.softAPgetStationNum());
 #endif
 }
 void draw_message(char *msg) {
@@ -101,12 +109,7 @@ void draw_message(char *msg) {
   oled.print(msg);   // печатай что угодно
 #endif
 }
-/*void sendUdpMessage(String ip,String str) {
-  // Передача данных по UDP
-    udp.beginPacket(ip, UDP_PORT);
-    udp.print(str);
-    udp.endPacket();
-}*/
+
 #ifdef ESP8266
 //подключение маяка к серверу
 void connectBeaconToServer() {
@@ -172,11 +175,11 @@ IRAM_ATTR void button_click() {
   button_pressed = true;
 }
 //функция, вызываемая когда получен звук
-IRAM_ATTR void sound_handler() {
-  int mic = analogRead(PIN_MIC);
-  if (mic > max_mic + 400) {
-    uint64_t t;
+/*IRAM_ATTR void sound_handler() {
+  //int mic = analogRead(PIN_MIC);
+  //if (mic > max_mic + 400) {
 #ifdef ESP8266
+    uint64_t t;
     t = mtime() + DELTA;
     //Получен звуковой сигнал от робота. Передаем на сервер время срабатывания
     udp.beginPacket(udpServerIP, UDP_PORT);
@@ -185,13 +188,13 @@ IRAM_ATTR void sound_handler() {
 #endif
 
 #ifdef ESP32
-    t = mtime();
+    lastSoundTime = mtime();
 #endif
     //отключаем микрофон
-    detachInterrupt(PIN_MIC);
-  }
-}
-#ifdef ESP32
+    detachInterrupt(PIN_MIC_DGT);
+  //}
+}*/
+/*#ifdef ESP32
 void ARDUINO_ISR_ATTR endOfMicCalibration() {
   // калибровка уровня шума завершена
   Serial.println("Уровень шума:");
@@ -208,12 +211,14 @@ void endOfMicCalibration() {
   blinker.detach();
   connectBeaconToServer();
 }
-#endif
+#endif*/
 //выполнение команд на сервере
 void server_command(char *packetBuffer, IPAddress ip) {
-  Serial.println('server command');
+  Serial.println("server command");
 #ifdef ESP32
-  int command = (int)packetBuffer[0];
+  String c(packetBuffer[0]);
+  int command = c.toInt();
+  Serial.print("command=");
   Serial.println(command);
   //получено время сигнала от маяка
   if (command == SOUND_TIME_RECEIVED) {
@@ -225,46 +230,71 @@ void server_command(char *packetBuffer, IPAddress ip) {
         beacon_answered_count += 1;
       }
     }
-    if (beacon_answered_count == beacon_count) {
+    if (beacon_answered_count == beacon_count && calculating_robot_coords) {
       //все маяки ответили, делаем расчет
-      //CalculateRobotCoords();
+      calculateRobotCoords();
     }
   }
   //маяк был передвинут, необходимо перекалибровка маяков
   if (command == NEED_RECALIBRATE) {
-    Serial.println("need recalibrate");
-    for (int i = 0; i < beacon_count; i++) {
-      deviceData[i] = 0;
-    }
+    server_need_recalibrate(packetBuffer, ip);
+    calculating_robot_coords = false;
     beacon_answered_count = 0;
-    serverData = 0;
-    String s = String(SET_STATUS_WAIT_FOR_SIGNAL) + ",0";
-    delay(3000);
-    udp.broadcast(s.c_str());
+  }
+  if (command == SET_STATUS_WAIT_FOR_SIGNAL) {
+    Serial.println("set status wait for signal");
+    //включить прерывание от микрофона
+    //detachInterrupt(PIN_MIC_DGT);
+    //attachInterrupt(PIN_MIC_DGT, sound_handler, RISING);
+    sound_waiting = true;
+    beacon_answered_count = 0;
   }
 
 //команда получена
 #endif
 }
+#ifdef ESP32
+void server_need_recalibrate(char *packetBuffer, IPAddress ip) {
+  Serial.println("need recalibrate");
+  //обнуляем массив с ответами маяков
+  for (int i = 0; i < beacon_count; i++) {
+    deviceData[i] = 0;
+  }
+  //обнуляем количество ответивших маяков
+  beacon_answered_count = 0;
+  lastSoundTime = 0;
+  String s = String(SET_STATUS_WAIT_FOR_SIGNAL) + ",0";
+  delay(3000);
+  udp.broadcast(s.c_str());
+  delay(1000);
+  udp2.beginPacket(ip, UDP_PORT);
+  udp2.printf("%d,%d", DO_MAKE_SOUND, 0);
+  udp2.endPacket();
+}
+#endif
 
 //выполнение команд на маяке
 void do_command(char *packetBuffer) {
-  Serial.println('beacon command');
-  int command = (int)packetBuffer[0];
+#ifdef ESP8266
+  Serial.println("beacon command");
+  String c(packetBuffer[0]);
+  int command = c.toInt();
   Serial.println(command);
   //ожидание звука
   if (command == SET_STATUS_WAIT_FOR_SIGNAL) {
     Serial.println("set status wait for signal");
-    Serial.println(packetBuffer);
     //включить прерывание от микрофона
-    detachInterrupt(PIN_MIC);
-    attachInterrupt(PIN_MIC, sound_handler, RISING);
+    //detachInterrupt(PIN_MIC_DGT);
+    //attachInterrupt(PIN_MIC_DGT, sound_handler, RISING);
+    sound_waiting = true;
   }
   //издать звук
   if (command == DO_MAKE_SOUND) {
     Serial.println("DO_MAKE_SOUND");
     Serial.println(packetBuffer);
-    tone(SOUND_PIN, 1000, 1000);
+    digitalWrite(SOUND_PIN, HIGH);
+    delay(100);
+    digitalWrite(SOUND_PIN, LOW);
   }
   //обновить расхожение времени в микросекундах с сервером
   if (command == DO_UPDATE_DELAY) {
@@ -276,9 +306,9 @@ void do_command(char *packetBuffer) {
   if (command == SET_STATUS_IDLE) {
     Serial.println("SET_STATUS_IDLE");
     Serial.println(packetBuffer);
-    detachInterrupt(PIN_MIC);
+    calculating_robot_coords = false;
+    //detachInterrupt(PIN_MIC);
   }
-#ifdef ESP8266
   udp.beginPacket(udpServerIP, UDP_PORT);
   udp.printf("%d,%c", COMMAND_RECEIVED, packetBuffer[0]);
   udp.endPacket();
@@ -357,14 +387,21 @@ void setup() {
 
   // устанавливаем пины на получение данных от датчиков
   pinMode(PIN_SENSOR, INPUT);
-  pinMode(PIN_MIC, INPUT);
+  pinMode(SOUND_PIN, OUTPUT);
 
-  // начинаем калибрацию микрофона
-  mic_calibration();
+// начинаем калибрацию микрофона
+//mic_calibration();
+#ifdef ESP8266
+  connectBeaconToServer();
+#endif
   wifi_init();
-  noTone(SOUND_PIN);
   attachInterrupt(BTN_PIN, button_click, RISING);
-  //butt1.setType(HIGH_PULL);
+  analyzer.setVolK(20);
+  analyzer.setTrsh(10);
+  analyzer.setVolMin(10);
+  analyzer.setVolMax(100);
+  analyzer.setDt(10);
+  analyzer.setWindow(10);
 }
 
 
@@ -399,29 +436,57 @@ void loop() {
   }
   if (button_pressed) {
     button_pressed = false;
-    tone(SOUND_PIN, 1000, 100);
-    Serial.println("Click");
-#ifdef ESP32
-    String s;
-    s += DO_MAKE_SOUND;
-    s += ",test";
-    Serial.println("button send command:");
-    Serial.println(s);
-    udp.broadcast(s.c_str());
-#endif
+    btn_click();
+  }
+  if (sound_waiting && analyzer.tick() && analyzer.getRaw() > 3) {
+    lastSoundTime = micros();
 #ifdef ESP8266
+    //отправляем временную метку на сервер
+    t = lastSoundTime + DELTA;
+    //Передаем на сервер время срабатывания
     udp.beginPacket(udpServerIP, UDP_PORT);
-    udp.print("5,test");
+    udp.printf("%d,%d", SOUND_TIME_RECEIVED, t);
     udp.endPacket();
 #endif
+
+#ifdef ESP32
+    //ожидаем ответа от всех маяков и начинаем расчет координат
+    calculating_robot_coords = true;
+    if (beacon_answered_count == beacon_count && calculating_robot_coords) {
+      //все маяки ответили, делаем расчет
+      calculateRobotCoords();
+    }
+#endif
   }
-  if (is_mic_calibration) {
+  /*if (is_mic_calibration) {
     int mic = analogRead(PIN_MIC);
     if (max_mic < mic) {
       max_mic = mic;
     }
-  }
+  }*/
 }
+//обработка нажатия кнопки
+void btn_click() {
+  tone(SOUND_PIN, 1000, 100);
+  Serial.println("Click");
+#ifdef ESP32
+  String s;
+  s += DO_UPDATE_DELAY;
+  s += ",";
+  s += String(mtime());
+  Serial.println("button send command:");
+  Serial.println(s);
+  udp.broadcast(s.c_str());
+#endif
+#ifdef ESP8266
+  udp.beginPacket(udpServerIP, UDP_PORT);
+  Serial.println("button send command:");
+  Serial.println("5,test");
+  udp.print("5,test");
+  udp.endPacket();
+#endif
+}
+
 // запускаем калибрацию микрофона
 void mic_calibration() {
   max_mic = 0;
@@ -435,4 +500,7 @@ void mic_calibration() {
   // Initialize Ticker every 0.5s
   blinker.attach_ms(wdtTimeout, endOfMicCalibration);  // Use attach_ms if you need time in ms
 #endif
+}
+
+void calculateRobotCoords() {
 }

@@ -3,6 +3,7 @@
 
 #define NUM_SLAVES 3
 #define SOUND_SPEED 343000 // Скорость звука в мм/с
+#define SYNC_INTERVAL 60000 // Интервал синхронизации времени (1 минута)
 
 typedef struct {
   uint32_t timestamp;
@@ -14,8 +15,13 @@ typedef struct {
   uint8_t ids[NUM_SLAVES];
 } SlaveTimings;
 
+typedef struct {
+  uint32_t masterTime;
+} SyncPacket;
+
 SlaveTimings slaveTimings;
 bool allTimingsReceived = false;
+unsigned long lastSyncTime = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -26,9 +32,17 @@ void setup() {
   }
 
   esp_now_register_recv_cb(OnDataRecv);
+  lastSyncTime = millis();
 }
 
 void loop() {
+  // Синхронизация времени каждую минуту
+  if (millis() - lastSyncTime >= SYNC_INTERVAL) {
+    syncTime();
+    lastSyncTime = millis();
+  }
+
+  // Расчет координат источника звука
   if (allTimingsReceived) {
     calculateSoundSource();
     allTimingsReceived = false;
@@ -57,6 +71,16 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if (allReceived) {
     allTimingsReceived = true;
   }
+}
+
+void syncTime() {
+  SyncPacket syncPacket;
+  syncPacket.masterTime = micros(); // Текущее время ESP32 в микросекундах
+
+  // Отправка пакета синхронизации всем ESP8266
+  uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Широковещательный адрес
+  esp_now_send(broadcastAddress, (uint8_t *)&syncPacket, sizeof(syncPacket));
+  Serial.println("Time synchronization packet sent");
 }
 
 void calculateSoundSource() {

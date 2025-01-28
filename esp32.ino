@@ -102,37 +102,15 @@ void calculateSoundSource() {
   float x2 = 500, y2 = 500; // ESP8266 #2
   float x3 = 0, y3 = 500; // ESP8266 #3
 
-  // Решение системы уравнений для нахождения координат источника звука
-  float A = 2 * (x1 - x0);
-  float B = 2 * (y1 - y0);
-  float C = dt1 * dt1 - dt0 * dt0 - (x1 * x1 - x0 * x0) - (y1 * y1 - y0 * y0);
-
-  float D = 2 * (x2 - x0);
-  float E = 2 * (y2 - y0);
-  float F = dt2 * dt2 - dt0 * dt0 - (x2 * x2 - x0 * x0) - (y2 * y2 - y0 * y0);
-
-  float G = 2 * (x3 - x0);
-  float H = 2 * (y3 - y0);
-  float I = dt3 * dt3 - dt0 * dt0 - (x3 * x3 - x0 * x0) - (y3 * y3 - y0 * y0);
-
-  // Решение системы уравнений методом Крамера
-  float det = A * (E * I - F * H) - B * (D * I - F * G) + C * (D * H - E * G);
-  if (det == 0) {
-    Serial.println("No solution (det == 0)");
-    return;
-  }
-
-  float x = (C * (E * I - F * H) - B * (F * I - F * G) + C * (F * H - E * G)) / det;
-  float y = (A * (F * I - F * G) - C * (D * I - F * G) + C * (D * H - E * G)) / det;
-
-  // Отбрасывание некорректных измерений
+  // Вычисление расстояний от предполагаемого источника звука до каждого устройства
   float distances[4] = {
-    sqrt((x - x0) * (x - x0) + (y - y0) * (y - y0)),
-    sqrt((x - x1) * (x - x1) + (y - y1) * (y - y1)),
-    sqrt((x - x2) * (x - x2) + (y - y2) * (y - y2)),
-    sqrt((x - x3) * (x - x3) + (y - y3) * (y - y3))
+    sqrt((x0 - x0) * (x0 - x0) + (y0 - y0) * (y0 - y0)) + dt0,
+    sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)) + dt1,
+    sqrt((x2 - x0) * (x2 - x0) + (y2 - y0) * (y2 - y0)) + dt2,
+    sqrt((x3 - x0) * (x3 - x0) + (y3 - y0) * (y3 - y0)) + dt3
   };
 
+  // Поиск выброса (некорректного измерения)
   float avgDistance = (distances[0] + distances[1] + distances[2] + distances[3]) / 4;
   float maxDeviation = 0;
   int outlierIndex = -1;
@@ -145,27 +123,75 @@ void calculateSoundSource() {
     }
   }
 
-  // Если найдено некорректное измерение, пересчитываем координаты без него
+  // Если найден выброс, пересчитываем координаты без него
   if (outlierIndex != -1) {
-    Serial.println("Outlier detected, recalculating...");
-    if (outlierIndex == 0) {
-      x = (C * (E * I - F * H) - B * (F * I - F * G) + C * (F * H - E * G)) / det;
-      y = (A * (F * I - F * G) - C * (D * I - F * G) + C * (D * H - E * G)) / det;
-    } else if (outlierIndex == 1) {
-      x = (C * (E * I - F * H) - B * (F * I - F * G) + C * (F * H - E * G)) / det;
-      y = (A * (F * I - F * G) - C * (D * I - F * G) + C * (D * H - E * G)) / det;
-    } else if (outlierIndex == 2) {
-      x = (C * (E * I - F * H) - B * (F * I - F * G) + C * (F * H - E * G)) / det;
-      y = (A * (F * I - F * G) - C * (D * I - F * G) + C * (D * H - E * G)) / det;
-    } else if (outlierIndex == 3) {
-      x = (C * (E * I - F * H) - B * (F * I - F * G) + C * (F * H - E * G)) / det;
-      y = (A * (F * I - F * G) - C * (D * I - F * G) + C * (D * H - E * G)) / det;
-    }
-  }
+    Serial.print("Outlier detected at index: ");
+    Serial.println(outlierIndex);
 
-  Serial.print("Sound source coordinates: (");
-  Serial.print(x);
-  Serial.print(", ");
-  Serial.print(y);
-  Serial.println(") mm");
+    // Удаляем выброс из данных
+    uint32_t timestamps[3];
+    float x[3], y[3];
+    int index = 0;
+
+    for (int i = 0; i < 4; i++) {
+      if (i != outlierIndex) {
+        timestamps[index] = slaveTimings.timestamps[i];
+        x[index] = (i == 0) ? x0 : (i == 1) ? x1 : (i == 2) ? x2 : x3;
+        y[index] = (i == 0) ? y0 : (i == 1) ? y1 : (i == 2) ? y2 : y3;
+        index++;
+      }
+    }
+
+    // Решение системы уравнений для трех точек
+    float A = 2 * (x[1] - x[0]);
+    float B = 2 * (y[1] - y[0]);
+    float C = timestamps[1] * timestamps[1] - timestamps[0] * timestamps[0] - (x[1] * x[1] - x[0] * x[0]) - (y[1] * y[1] - y[0] * y[0]);
+
+    float D = 2 * (x[2] - x[0]);
+    float E = 2 * (y[2] - y[0]);
+    float F = timestamps[2] * timestamps[2] - timestamps[0] * timestamps[0] - (x[2] * x[2] - x[0] * x[0]) - (y[2] * y[2] - y[0] * y[0]);
+
+    float det = A * E - B * D;
+    if (det == 0) {
+      Serial.println("No solution (det == 0)");
+      return;
+    }
+
+    float x_source = (C * E - B * F) / det;
+    float y_source = (A * F - C * D) / det;
+
+    Serial.print("Recalculated sound source coordinates: (");
+    Serial.print(x_source);
+    Serial.print(", ");
+    Serial.print(y_source);
+    Serial.println(") mm");
+  } else {
+    // Если выбросов нет, используем все четыре измерения
+    float A = 2 * (x1 - x0);
+    float B = 2 * (y1 - y0);
+    float C = dt1 * dt1 - dt0 * dt0 - (x1 * x1 - x0 * x0) - (y1 * y1 - y0 * y0);
+
+    float D = 2 * (x2 - x0);
+    float E = 2 * (y2 - y0);
+    float F = dt2 * dt2 - dt0 * dt0 - (x2 * x2 - x0 * x0) - (y2 * y2 - y0 * y0);
+
+    float G = 2 * (x3 - x0);
+    float H = 2 * (y3 - y0);
+    float I = dt3 * dt3 - dt0 * dt0 - (x3 * x3 - x0 * x0) - (y3 * y3 - y0 * y0);
+
+    float det = A * (E * I - F * H) - B * (D * I - F * G) + C * (D * H - E * G);
+    if (det == 0) {
+      Serial.println("No solution (det == 0)");
+      return;
+    }
+
+    float x_source = (C * (E * I - F * H) - B * (F * I - F * G) + C * (F * H - E * G)) / det;
+    float y_source = (A * (F * I - F * G) - C * (D * I - F * G) + C * (D * H - E * G)) / det;
+
+    Serial.print("Sound source coordinates: (");
+    Serial.print(x_source);
+    Serial.print(", ");
+    Serial.print(y_source);
+    Serial.println(") mm");
+  }
 }

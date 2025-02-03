@@ -11,11 +11,11 @@ typedef struct {
 } SlaveData;
 
 typedef struct {
-  uint32_t masterTime;
-} SyncPacket;
+  uint8_t command; // 1 - издать звук, 0 - остановить
+} BeaconCommand;
 
 SlaveData myData;
-uint32_t timeOffset = 0; // Смещение времени относительно ESP32
+bool soundActive = false;
 
 void setup() {
   Serial.begin(115200);
@@ -34,26 +34,25 @@ void setup() {
 }
 
 void loop() {
-  if (detectSound()) {
-    myData.timestamp = micros() + timeOffset; // Корректировка времени с учетом смещения
-    esp_now_send(masterAddress, (uint8_t *)&myData, sizeof(myData));
-    delay(1000); // Задержка для предотвращения множественных отправок
+  if (soundActive) {
+    // Издание звука (например, включение пьезодинамика)
+    tone(5, 1000); // Пьезодинамик на пине 5, частота 1000 Гц
+  } else {
+    noTone(5); // Выключение звука
   }
 }
 
-bool detectSound() {
-  // Логика обнаружения звука
-  // Возвращает true, если звук обнаружен
-  return false; // Замените на реальную логику
-}
-
 void OnDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
-  if (len == sizeof(SyncPacket)) {
-    SyncPacket syncPacket;
-    memcpy(&syncPacket, incomingData, sizeof(syncPacket));
+  if (len == sizeof(BeaconCommand)) {
+    BeaconCommand command;
+    memcpy(&command, incomingData, sizeof(command));
 
-    // Корректировка времени
-    timeOffset = syncPacket.masterTime - micros();
-    Serial.println("Time synchronized with master");
+    if (command.command == 1) {
+      soundActive = true;
+      myData.timestamp = micros(); // Запись времени издания звука
+      esp_now_send(masterAddress, (uint8_t *)&myData, sizeof(myData));
+    } else {
+      soundActive = false;
+    }
   }
 }

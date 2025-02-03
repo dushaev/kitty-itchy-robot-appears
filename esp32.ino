@@ -22,9 +22,15 @@ typedef struct {
   uint32_t masterTime;
 } SyncPacket;
 
+typedef struct {
+  uint8_t command; // 1 - издать звук, 0 - остановить
+} BeaconCommand;
+
 SlaveTimings slaveTimings;
 bool allTimingsReceived = false;
 unsigned long lastSyncTime = 0;
+bool beaconsLocated = false;
+float beaconCoordinates[NUM_SLAVES][2]; // Координаты маяков (x, y)
 
 // Координаты устройств (в мм)
 float deviceX[NUM_SLAVES + 1] = {0, 500, 500, 0}; // x0, x1, x2, x3
@@ -39,6 +45,7 @@ void setup() {
   }
 
   esp_now_register_recv_cb(OnDataRecv);
+  esp_now_register_send_cb(OnDataSent);
   lastSyncTime = millis();
 }
 
@@ -49,10 +56,15 @@ void loop() {
     lastSyncTime = millis();
   }
 
-  // Расчет координат источника звука
-  if (allTimingsReceived) {
-    calculateSoundSource();
+  // Если маяки еще не локализованы, локализуем их
+  if (!beaconsLocated && allTimingsReceived) {
+    locateBeacons();
     allTimingsReceived = false;
+  }
+
+  // Если маяки локализованы, переходим в режим ожидания звука
+  if (beaconsLocated) {
+    // Режим ожидания звука (можно добавить логику)
   }
 }
 
@@ -80,6 +92,14 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   }
 }
 
+void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.println("Command sent successfully");
+  } else {
+    Serial.println("Command send failed");
+  }
+}
+
 void syncTime() {
   SyncPacket syncPacket;
   syncPacket.masterTime = micros(); // Текущее время ESP32 в микросекундах
@@ -96,7 +116,7 @@ float distance(float x1, float y1, float x2, float y2) {
 }
 
 // Итеративный метод для уточнения координат источника звука
-void calculateSoundSource() {
+void calculateSoundSource(float &x, float &y) {
   uint32_t t0 = slaveTimings.timestamps[0];
   uint32_t t1 = slaveTimings.timestamps[1];
   uint32_t t2 = slaveTimings.timestamps[2];
@@ -107,10 +127,6 @@ void calculateSoundSource() {
   float dt1 = (t1 - t0) * SOUND_SPEED / 1000000.0;
   float dt2 = (t2 - t0) * SOUND_SPEED / 1000000.0;
   float dt3 = (t3 - t0) * SOUND_SPEED / 1000000.0;
-
-  // Начальное предположение для координат источника звука
-  float x = 250.0; // Центр квадрата
-  float y = 250.0;
 
   // Итеративный метод наименьших квадратов
   for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
@@ -134,10 +150,47 @@ void calculateSoundSource() {
       break;
     }
   }
+}
 
-  Serial.print("Sound source coordinates: (");
-  Serial.print(x);
-  Serial.print(", ");
-  Serial.print(y);
-  Serial.println(") mm");
+// Локализация маяков
+void locateBeacons() {
+  for (int i = 0; i < NUM_SLAVES; i++) {
+    // Отправка команды маяку на издание звука
+    BeaconCommand command;
+    command.command = 1; // Издать звук
+    uint8_t beaconAddress[] = {0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56}; // Замените на MAC-адрес маяка
+    esp_now_send(beaconAddress, (uint8_t *)&command, sizeof(command));
+
+    // Ожидание данных от всех устройств
+    while (!allTimingsReceived) {
+      delay(10);
+    }
+
+    // Расчет координат маяка
+    float x = 250.0, y = 250.0; // Начальное предположение
+    calculateSoundSource(x, y);
+
+    // Запоминание координат маяка
+    beaconCoordinates[i][0] = x;
+    beaconCoordinates[i][1] = y;
+
+    Serial.print("Beacon ");
+    Serial.print(i);
+    Serial.print(" coordinates: (");
+    Serial.print(x);
+    Serial.print(", ");
+    Serial.print(y);
+    Serial.println(") mm");
+
+    // Остановка звука на маяке
+    command.command = 0; // Остановить звук
+    esp_now_send(beaconAddress, (uint8_t *)&command, sizeof(command));
+
+    // Сброс флага для следующего маяка
+    allTimingsReceived = false;
+  }
+
+  // Все маяки локализованы
+  beaconsLocated = true;
+  Serial.println("All beacons located");
 }

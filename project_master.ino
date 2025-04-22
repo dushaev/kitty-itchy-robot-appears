@@ -1,17 +1,18 @@
 #include <WiFi.h>
 #include <esp_now.h>
-
 #include <math.h>
 #include <GyverOLED.h>
-#include <VolAnalyzer.h>
-
-#include <BluetoothSerial.h>  //отладка, потом удалить
+#include "esp_bt.h"
+#include <driver/adc.h>
+#include <esp_timer.h>
+#include "esp_wifi.h"
 
 #define SOUND_PIN 15  //Пин пьезодинамика
 #define PIN_SENSOR 4  // Пин, к которому присоединен датчик вибрации
 #define PIN_MIC 32    // Пин, к которому присоединен микрофон
 #define PIN_SDA 27    // Дисплей SDA
 #define PIN_SCK 14    // Дисплей SCK
+#define ADC_CHANNEL     ADC1_CHANNEL_4
 
 #define UDP_PORT 4210           // Порт для UDP синхронизации
 #define ESPNOW_WIFI_CHANNEL 1   // канал общения с маяками
@@ -22,13 +23,23 @@
 #define TOLERANCE 1.0           // Точность расчета (мм)
 #define DATA_TIMEOUT 1000000    // Лимит ожидания данных (1 секунда в микросекундах)
 
-#define SET_STATUS_IDLE 8   //статус бездействие
-#define WAIT_FOR_SIGNAL 7   //ожидание звука
-#define DO_MAKE_SOUND 2     //издать звук
-#define DO_UPDATE_DELAY 3   //обновить расхожение времени в микросекундах с сервером
-#define NEED_RECALIBRATE 5  //требуется калибровка местоположения маяков
-#define IS_CALIBRATING 6    //в процессе калибровки местоположения маяков
-#define IS_CALCULATING 4    //в процессе расчета
+#define SET_STATUS_IDLE 8       //статус бездействие
+#define WAIT_FOR_SIGNAL 7       //ожидание звука
+#define DO_MAKE_SOUND 2         //издать звук
+#define DO_UPDATE_DELAY 3       //обновить расхожение времени в микросекундах с сервером
+#define NEED_RECALIBRATE 5      //требуется калибровка местоположения маяков
+#define SWITCHING_FOR_SIGNAL 6  //в процессе переключения в режим поиска робота
+#define IS_CALCULATING 4        //в процессе расчета
+#define TIME_SYNC_STARTED 9     //в процессе синхронизации времени
+#define SOUNDSPEED 0.343f       // Скорость звука в мм/мкс
+#define SIDE 500.0f             // Длина стороны квадрата в мм
+#define MAX_ITERATION 100000    // Максимальное количество итераций (уменьшено для Arduino)
+
+struct Result {
+  int x;
+  int y;
+  float check;
+};
 
 typedef struct {
   uint32_t timestamp;
@@ -57,8 +68,12 @@ bool calibrationDataReceived = false;  //данные для калибровк�
 bool serverReceiveSound = false;       //сервер получил сигнал
 int device_status = SET_STATUS_IDLE;   //текущий статус сервера
 int calibrate_step = 0;                //шаг калибровки
-int beacons_located_count = 0;         //количество маяков, которые обнаружены
+int beacons_count = 0;                 //количество маяков, которые обнаружены
+int beacons_ready = 0;                 //количество маяков, которые получили сигнал
 int dataBeaconReceived = 0;            //кол-во данных от маяков получено
+int time_synced = 0;                   //таймеры синхронизированы
+unsigned long m = 0;
+unsigned long s = 0;  //время получения сигнала сервером
 
 uint8_t beacon[NUM_SLAVES][6] = { { 0x0A, 0xF9, 0xE0, 0x73, 0x73, 0xB1 },    //7566257: Mac 08:F9:E0:73:73:B1
                                   { 0x0A, 0xF9, 0xE0, 0x78, 0x39, 0xF1 },    //7879153: Mac 08:F9:E0:78:39:F1
@@ -73,14 +88,20 @@ struct __attribute__((packed)) TimeSyncPacket {
   uint8_t beacon_id;
 };
 
-VolAnalyzer analyzer(PIN_MIC);
 GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
 
-BluetoothSerial ESP_BT;
-hw_timer_t *timer = NULL;
+uint32_t max_noice;
+uint32_t last_send;
+
+const char cx[] = { 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H' };
+const int cy[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 
 void setup() {
   Serial.begin(115200);
+  setCpuFrequencyMhz(240);
+  esp_bt_controller_disable();
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_11);
   WiFi.mode(WIFI_AP_STA);
   WiFi.setChannel(ESPNOW_WIFI_CHANNEL);
   WiFi.disconnect();
@@ -108,180 +129,73 @@ void setup() {
   esp_now_register_recv_cb(OnDataRecv);
   esp_now_register_send_cb(OnDataSent);  //отключить после отладки
 
-  pinMode(PIN_SENSOR, INPUT);  //переводим пин в режим получения информации
   pinMode(SOUND_PIN, OUTPUT);  //переводим пин в режим отправки информации
 
-  analyzer.setVolK(20);  //настройка параметров микрофона
-  analyzer.setTrsh(10);
-  analyzer.setVolMin(10);
-  analyzer.setVolMax(100);
-  analyzer.setDt(10);
-  analyzer.setWindow(10);
   oled.init(PIN_SDA, PIN_SCK);
   oled.clear();
   oled.home();
   draw_waiting_for_beacons();  //отображаем на экране ожидание маяков
-  ESP_BT.begin("ESP32_Serial");
-  ESP_BT.println("Start ");
-  ESP_BT.println(Network.macAddress());
-  Serial.println(Network.macAddress());
 
-  // Инициализация таймера
-  timer = timerBegin(0, 80, true);
-  timerAttachInterrupt(timer, &detectSound, true);
-  timerAlarmWrite(timer, 1000000, true);  // 1 мкс разрешение
-  timerStart(timer);
+  digitalWrite(SOUND_PIN, HIGH);  //издаем звук
+  delay(100);                     //ожидание 100 мс
+  digitalWrite(SOUND_PIN, LOW);   //выключаем звук
 }
 
 void loop() {
   //запуск синхронизации таймеров когда все маяки подключены
-  if (!time_synced) {
+  if (!time_synced && device_status == SET_STATUS_IDLE) {
     refresh_beacon_connected();
     if (beacons_count == 3) {
       //синхронизация времени
+      device_status = TIME_SYNC_STARTED;
       syncTime();
-    }
-  } else if (!beaconsLocated) {
-    //сервер слушает микрофон
-    if (device_status == IS_CALIBRATING && !serverReceiveSound && detectSound()) {
-      serverSoundTime = micros();
-      serverReceiveSound = true;
-      ESP_BT.print(F("Звук получен сервером: "));
-      ESP_BT.println(serverSoundTime);
-    }
-
-    //старт определения координат маяка 1
-    if (calibrate_step == 0) {
-      start_locate_beacon(0);
-    }
-
-    //если получены данные сервером и от маяков, запуск расчета маяка 1
-    if (calibrate_step == 1 && serverReceiveSound && device_status == IS_CALIBRATING && dataBeaconReceived) {
-      calculateBeaconCoords();
-    }
-
-    //старт определения координат маяка 2
-    if (calibrate_step == 1 && device_status == SET_STATUS_IDLE) {
-      start_locate_beacon(1);
-    }
-
-    //если получены данные сервером и от маяков, запуск расчета маяка 2
-    if (calibrate_step == 2 && serverReceiveSound && device_status == IS_CALIBRATING && dataBeaconReceived == 2) {
-      calculateBeaconCoords();
-    }
-
-    //старт определения координат маяка 3
-    if (calibrate_step == 2 && device_status == SET_STATUS_IDLE) {
-      start_locate_beacon(2);
-    }
-
-    //если получены данные сервером и от маяков, запуск расчета маяка 3
-    if (calibrate_step == 3 && serverReceiveSound && device_status == IS_CALIBRATING && dataBeaconReceived == 2) {
-      calculateBeaconCoords();
-    }
-
-    if (calibrate_step == 3 && device_status == SET_STATUS_IDLE) {
-      beaconsLocated = true;
-      initialState();
-    }
-
-  } else {
-    // Если маяки рассчитаны, переходим в режим ожидания звука
-    if (!serverReceiveSound && detectSound()) {
-      // Звук получен сервером
-      serverSoundTime = micros();
-      serverReceiveSound = true;
-      ESP_BT.print(F("Звук получен сервером: "));
-      ESP_BT.println(serverSoundTime);
-    }
-
-    //mainflow();
-
-    if (serverReceiveSound && device_status == IS_CALIBRATING && dataBeaconReceived == 3) {
-      float x = deviceX[3] / 2, y = deviceY[1] / 2;  // Начальное предположение примерно посередине
-      calculateSoundSource(x, y);
-      String s = "";
-      s += x;
-      s += ",";
-      s += y;
-      draw_coords(s);
-    }
-  }
-}
-
-// Функция синхронизации времени
-void syncTime() {
-  TimeSyncPacket packet;
-  packet.master_time = micros();
-
-  // Отправка синхронизации всем маякам
-  esp_now_send(beacon[0], (uint8_t *)&packet, sizeof(packet));
-  packet.master_time = micros();
-  esp_now_send(beacon[1], (uint8_t *)&packet, sizeof(packet));
-  packet.master_time = micros();
-  esp_now_send(beacon[2], (uint8_t *)&packet, sizeof(packet));
-}
-
-void refresh_beacon_connected() {
-  beacons_count = 0;
-  for (int i = 0; i < NUM_SLAVES + 1; i++) {
-    if (slaveTimings.is_connected[i]) {
-      beacons_count++;
-    }
-  }
-}
-
-bool detectSound() {
-  if (analyzer.tick() && analyzer.getRaw() > 5) {
-    return true;
-  }
-  return false;
-}
-
-void mainflow() {
-  int beacons_count = 0;
-  int timestamp_count = 0;
-  for (int i = 0; i < NUM_SLAVES + 1; i++) {
-    if (slaveTimings.is_connected[i]) {
-      beacons_count++;
-    }
-    if (slaveTimings.timestamps[i] != 0) {
-      timestamp_count++;
-    }
-  }
-  /*ESP_BT.print(F("timestamp_count="));
-  ESP_BT.println(timestamp_count);
-  ESP_BT.print(F("beacons_count="));
-  ESP_BT.println(beacons_count);*/
-  if (device_status == IS_CALIBRATING) {
-    if (calibrate_step == 0 || calibrate_step == 3) {
-      //ESP_BT.print(F("automatic calibration data received"));
-      calibrationDataReceived = true;
-    } else if (calibrate_step == 1 || calibrate_step == 2) {
-      if (timestamp_count) {
-        //ESP_BT.println(F("calibration data received"));
-        calibrationDataReceived = true;
+    } else {
+      s = adc1_get_raw(ADC_CHANNEL);
+      if (s > max_noice) {
+        max_noice = s;
+        oled.clear();
+        oled.home();       // курсор в 0,0
+        oled.setScale(2);  // масштаб шрифта (1-4)
+        oled.print(beacons_count);
+        oled.print(F("; "));
+        oled.print(max_noice);
+        oled.update();
       }
     }
-  }
-  if (slaveTimings.beacons_count != NUM_SLAVES) {
-    slaveTimings.beacons_count = beacons_count;  //обновляем количество подключенных маяков
-    if (beacons_count == NUM_SLAVES) {
-      //запускаем калибровку маяков по одному
-      device_status = NEED_RECALIBRATE;
-    }
-  }
+  } 
+  else if (device_status != TIME_SYNC_STARTED) {
+    // режим ожидания звука
+    if (!serverReceiveSound) {
+      s = adc1_get_raw(ADC_CHANNEL);
+      if (s > max_noice + 50) {
+        // Звук получен сервером
+        serverSoundTime = esp_timer_get_time();
+        serverReceiveSound = true;
+        esp_wifi_start();
+      }
+    } else {
 
-  bool allReceived = true;
-  for (int i = 0; i < NUM_SLAVES + 1; i++) {
-    if (slaveTimings.timestamps[i] == 0) {
-      allReceived = false;
-      break;
+      //если данные от всех маяков получены, то выводим их на экран
+      if (device_status == WAIT_FOR_SIGNAL && dataBeaconReceived == 3) {
+        float x, y;
+        calculateCoordinates(serverSoundTime, slaveTimings.timestamps[0], slaveTimings.timestamps[1], slaveTimings.timestamps[2], x, y);
+        device_status = IS_CALCULATING;
+        char ax;
+        int ay;
+        convertCoordinates(x, y, ax, ay);
+        String s = "";
+        s += ax;
+        s += ay;
+        draw_coords(s);
+        //switchToSignal();
+        device_status = TIME_SYNC_STARTED;
+        syncTime();
+      } else if (last_send + 5000 < millis()) {
+        //switchToSignal();
+        device_status = TIME_SYNC_STARTED;
+        syncTime();
+      }
     }
-  }
-
-  if (allReceived) {
-    allTimingsReceived = true;
   }
 }
 
@@ -302,287 +216,60 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
       }
     }
   }
-  ESP_BT.print(F("Данные получены от "));
-  ESP_BT.println(data.id);
-
-  ESP_BT.print(F("Тип="));
-  ESP_BT.println(data.type);
-  ESP_BT.print(F("timestamp="));
-  ESP_BT.println(data.timestamp);
-  ESP_BT.print(F("device_status="));
-  ESP_BT.println(device_status);
-  ESP_BT.print(F("calibrate_step="));
-  ESP_BT.println(calibrate_step);
 }
 
-
-
-// Функция для расчета расстояния между двумя точками
-float distance(float x1, float y1, float x2, float y2) {
-  return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
-}
-
-// Итеративный метод для уточнения координат источника звука
-void calculateSoundSource(float &x, float &y) {
-  uint32_t t0 = slaveTimings.timestamps[0];
-  uint32_t t1 = slaveTimings.timestamps[1];
-  uint32_t t2 = slaveTimings.timestamps[2];
-  uint32_t t3 = serverSoundTime;  // Данные с ESP32
-
-  // Вычисление разницы во времени
-  float dt0 = (t0 - t0) * SOUND_SPEED / 1000000.0;
-  float dt1 = (t1 - t0) * SOUND_SPEED / 1000000.0;
-  float dt2 = (t2 - t0) * SOUND_SPEED / 1000000.0;
-  float dt3 = (t3 - t0) * SOUND_SPEED / 1000000.0;
-
-  // Итеративный метод наименьших квадратов
-  for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
-    float gradX = 0.0, gradY = 0.0;
-
-    // Вычисление градиента
-    for (int i = 0; i < NUM_SLAVES + 1; i++) {
-      float dist = distance(x, y, deviceX[i], deviceY[i]);
-      float error = dist - ((i == 0) ? dt0 : (i == 1) ? dt1
-                                           : (i == 2) ? dt2
-                                                      : dt3);
-
-      gradX += (x - deviceX[i]) / dist * error;
-      gradY += (y - deviceY[i]) / dist * error;
-    }
-
-    // Коррекция координат
-    x -= 0.1 * gradX;  // Шаг обучения
-    y -= 0.1 * gradY;
-
-    // Проверка на сходимость
-    if (sqrt(gradX * gradX + gradY * gradY) < TOLERANCE) {
-      break;
-    }
-  }
-}
-
-void start_locate_beacon(int beacon_num) {
-  int esp_now_err;
-  device_status = IS_CALIBRATING;
-  String s = F("Locating beacons (");
-  s += calibrate_step;
-  s += F(")...");
-  draw_serial(s);
-  ESP_BT.println(s);
-  serverReceiveSound = false;
-  BeaconCommand command;
-  dataBeaconReceived = 0;
-  if (calibrate_step == 0) {
-    calibrate_step++;
-    //первый маяк
-    delay(200);
-    command.command = DO_MAKE_SOUND;  // Издать звук
-
-    esp_now_err = esp_now_send(beacon[0], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send do sound to beacon 1: "));
-    ESP_BT.println(esp_now_err);
-  }
-  if (calibrate_step == 1) {
-    calibrate_step++;
-    //второй маяк
-    delay(1000);
-    command.masterTime = micros();
-    command.command = 1;  // Ожидание звука
-    esp_now_err = esp_now_send(beacon[0], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send wait for signal to beacon 1: "));
-    ESP_BT.println(esp_now_err);
-    delay(200);
-    //отправка звука
-    command.masterTime = micros();
-    command.command = DO_MAKE_SOUND;  // Издать звук
-    esp_now_err = esp_now_send(beacon[1], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send do sound to beacon 2: "));
-    ESP_BT.println(esp_now_err);
-  }
-  if (calibrate_step == 2) {
-    calibrate_step++;
-    //третий маяк
-    delay(400);
-    command.masterTime = micros();
-    command.command = WAIT_FOR_SIGNAL;  // Ожидание звука
-    esp_now_err = esp_now_send(beacon[0], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send wait for signal to beacon 1: "));
-    ESP_BT.println(esp_now_err);
-    delay(200);
-    //отправка звука
-    command.masterTime = micros();
-    command.command = DO_MAKE_SOUND;  // Издать звук
-    esp_now_err = esp_now_send(beacon[2], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send do sound to beacon 3: "));
-    ESP_BT.println(esp_now_err);
-  }
-  if (calibrate_step == 3) {
-    //конец калибровки, переход в рабочий режим
-    beaconsLocated = true;
-    initialState();
-    device_status = SET_STATUS_IDLE;
-    ESP_BT.println(F("All beacons located"));
-    //draw_serial(F("All beacons located"));
-    draw_beacon_coords();
-  }
-}
-
-// Локализация маяков
-void locateBeacons() {
-  int esp_now_err;
-  device_status = IS_CALIBRATING;  //чтобы не вызвать два раза
-  String s = F("Locating beacons (");
-  s += calibrate_step;
-  s += F(")...");
-  draw_serial(s);
-  ESP_BT.println(s);
-  serverReceiveSound = false;
-  BeaconCommand command;
-  //на каком шаге мы находимся?
-  if (calibrate_step == 0) {
-    //первый маяк
-    //если маяк подключен, просим его издать сигнал
-    if (slaveTimings.is_connected[0]) {
-      delay(200);
-      command.masterTime = micros();
-      command.command = DO_MAKE_SOUND;  // Издать звук
-
-      esp_now_err = esp_now_send(beacon[0], (uint8_t *)&command, sizeof(command));
-      ESP_BT.print(F("send do sound to beacon 1: "));
-      ESP_BT.println(esp_now_err);
-    } else {
-      device_status = NEED_RECALIBRATE;
-    }
-  }
-  if (calibrate_step == 1) {
-    //второй маяк
-    delay(1000);
-    command.masterTime = micros();
-    command.command = 1;  // Ожидание звука
-    esp_now_err = esp_now_send(beacon[0], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send wait for signal to beacon 1: "));
-    ESP_BT.println(esp_now_err);
-    delay(200);
-    //отправка звука
-    command.masterTime = micros();
-    command.command = DO_MAKE_SOUND;  // Издать звук
-    esp_now_err = esp_now_send(beacon[1], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send do sound to beacon 2: "));
-    ESP_BT.println(esp_now_err);
-  }
-  if (calibrate_step == 2) {
-    //третий маяк
-    delay(400);
-    command.masterTime = micros();
-    command.command = WAIT_FOR_SIGNAL;  // Ожидание звука
-    esp_now_err = esp_now_send(beacon[0], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send wait for signal to beacon 1: "));
-    ESP_BT.println(esp_now_err);
-    delay(200);
-    //отправка звука
-    command.masterTime = micros();
-    command.command = DO_MAKE_SOUND;  // Издать звук
-    esp_now_err = esp_now_send(beacon[2], (uint8_t *)&command, sizeof(command));
-    ESP_BT.print(F("send do sound to beacon 3: "));
-    ESP_BT.println(esp_now_err);
-  }
-  if (calibrate_step == 3) {
-    //конец калибровки, переход в рабочий режим
-    beaconsLocated = true;
-    initialState();
-    device_status = SET_STATUS_IDLE;
-    ESP_BT.println(F("All beacons located"));
-    //draw_serial(F("All beacons located"));
-    draw_beacon_coords();
+// Функция, которая возвращает строку по переданному числу
+const char *getStatusString(int code) {
+  switch (code) {
+    case 8:
+      return "бездействие";
+    case 7:
+      return "ожидание сигнала";
+    case 1:
+      return "ожидание сигнала";
+    case 2:
+      return "издать сигнал";
+    case 3:
+      return "синхронизация времени";
+    case 5:
+      return "требуется калибровка";
+    case 6:
+      return "идет калибровка";
+    case 4:
+      return "идет расчет";
+    case 9:
+      return "начата синхронизация времени";
+    default:
+      return "неизвестный код";  // Возвращаем "UNKNOWN_CODE" для неизвестных кодов
   }
 }
 
 //сброс состояния сервера
 void initialState() {
-  ESP_BT.println(F("initial state"));
+  //ESP_BT.println(F("Сброс"));
   serverReceiveSound = false;
   dataBeaconReceived = 0;
   for (int i = 0; i < NUM_SLAVES + 1; i++) {
     slaveTimings.timestamps[i] = 0;
   }
+  beacons_ready = 0;
 }
 void switchToSignal() {
-  ESP_BT.println(F("switchToSignal"));
-  serverReceiveSound = false;
+  initialState();
   BeaconCommand command;
-  command.masterTime = micros();
+  command.masterTime = esp_timer_get_time();
   command.command = WAIT_FOR_SIGNAL;  // Ожидание звука
-  esp_now_send(NULL, (uint8_t *)&command, sizeof(command));
+  esp_now_send(beacon[0], (uint8_t *)&command, sizeof(command));
+  esp_now_send(beacon[1], (uint8_t *)&command, sizeof(command));
+  esp_now_send(beacon[2], (uint8_t *)&command, sizeof(command));
+  device_status = SWITCHING_FOR_SIGNAL;
   device_status = WAIT_FOR_SIGNAL;
-  ESP_BT.println(F("Ожидание сигнала робота"));
-  //draw_serial(F("Ожидание сигнала робота"));
-  draw_beacon_coords();
+  draw_serial(F("Ожидание сигнала робота"));
+  esp_wifi_stop();
+  last_send = millis();
 }
 
-void calculateBeaconCoords() {
-  device_status = IS_CALCULATING;
-  ESP_BT.println(F("Расчет положения маяка"));
-  ESP_BT.print(F("calibrate_step="));
-  ESP_BT.println(calibrate_step);
-  draw_serial(F("Расчет положения маяка"));
-  if (calibrate_step == 0) {
-    float dt0 = (serverSoundTime - dataRequestTime) * SOUND_SPEED / 1000000.0;
-    deviceX[1] = 0;
-    deviceY[1] = dt0;
-    String s = F("К=");
-    s += dt0;
-    draw_serial(s);
-    ESP_BT.println(s);
-    delay(1000);
-    device_status == IS_CALIBRATING;
-    return;
-  }
-  if (calibrate_step == 1) {
-    ESP_BT.print(F("serverSoundTime="));
-    ESP_BT.println(serverSoundTime);
-    ESP_BT.print(F("dataRequestTime="));
-    ESP_BT.println(dataRequestTime);
-    float dt0 = (serverSoundTime - dataRequestTime) * SOUND_SPEED / 1000000.0;
-    ESP_BT.println(dt0);
-    ESP_BT.print("slaveTimings.timestamps[0]=");
-    ESP_BT.println(slaveTimings.timestamps[0]);
-    float dt1 = (slaveTimings.timestamps[0] - dataRequestTime) * SOUND_SPEED / 1000000.0;
-    ESP_BT.println(dt1);
-    float p1 = (dt0 + dt1 + deviceY[1]) / 2;
-    ESP_BT.println(p1);
-    float Sq1 = sqrt(p1 * (p1 - dt0) * (p1 - dt1) * (p1 - deviceY[1]));
-    ESP_BT.println(Sq1);
-    float h1 = Sq1 / deviceY[1];
-    ESP_BT.println(h1);
-    deviceX[2] = h1;
-    deviceY[2] = sqrt(dt0 * dt0 - h1 * h1);
-    delay(1000);
-    device_status == IS_CALIBRATING;
-    return;
-  }
-  if (calibrate_step == 2) {
-    ESP_BT.print(F("serverSoundTime="));
-    ESP_BT.println(serverSoundTime);
-    ESP_BT.print(F("dataRequestTime="));
-    ESP_BT.println(dataRequestTime);
-    float dt0 = (serverSoundTime - dataRequestTime) * SOUND_SPEED / 1000000.0;
-    ESP_BT.println(dt0);
-    ESP_BT.print("slaveTimings.timestamps[0]=");
-    ESP_BT.println(slaveTimings.timestamps[0]);
-    float dt1 = (slaveTimings.timestamps[0] - dataRequestTime) * SOUND_SPEED / 1000000.0;
-    ESP_BT.println(dt1);
-    float p1 = (dt0 + dt1 + deviceY[1]) / 2;
-    ESP_BT.println(p1);
-    float Sq1 = sqrt(p1 * (p1 - dt0) * (p1 - dt1) * (p1 - deviceY[1]));
-    ESP_BT.println(Sq1);
-    float h1 = Sq1 / deviceY[1];
-    ESP_BT.println(h1);
-    deviceX[3] = h1;
-    deviceY[3] = sqrt(dt0 * dt0 - h1 * h1);
-    delay(1000);
-    device_status == IS_CALIBRATING;
-  }
-}
+
 void draw_beacon_coords() {
   oled.clear();
   oled.home();       // курсор в 0,0
@@ -623,6 +310,10 @@ void draw_serial(String msg) {
 
 void draw_coords(String msg) {
   oled.clear();
+  oled.fill(255);
+  oled.update();
+  delay(300);
+  oled.fill(0);
   oled.home();       // курсор в 0,0
   oled.setScale(1);  // масштаб шрифта (1-4)
   oled.print(F("Робот обнаружен:"));
@@ -640,13 +331,161 @@ void draw_waiting_for_beacons() {
   oled.update();
 }
 
+void draw_beacons_connected(int c) {
+  oled.clear();
+  oled.home();       // курсор в 0,0
+  oled.setScale(1);  // масштаб шрифта (1-4)
+  oled.print(F("Подключено маяков "));
+  oled.print(c);
+  oled.update();
+}
+
 void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    ESP_BT.print(F("Command sent successfully"));
-    ESP_BT.printf(" to %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  } else {
-    ESP_BT.print(F("Command send failed ("));
-    ESP_BT.print(status);
-    ESP_BT.printf(") to %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  int b = 3;
+  if (mac[3] == 0x73) {
+    b = 1;
+  } else if (mac[3] == 0x78) {
+    b = 2;
   }
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    beacons_ready++;
+  } else {
+  }
+}
+
+void refresh_beacon_connected() {
+  int old_beacon_count = beacons_count;
+  beacons_count = 0;
+  for (int i = 0; i < NUM_SLAVES + 1; i++) {
+    if (slaveTimings.is_connected[i]) {
+      beacons_count++;
+    }
+  }
+  if (beacons_count != old_beacon_count) {
+    draw_beacons_connected(beacons_count);
+  }
+}
+
+// Функция синхронизации времени
+void syncTime() {
+  esp_wifi_start();
+  TimeSyncPacket packet;
+  packet.master_time = esp_timer_get_time();
+
+  // Отправка синхронизации всем маякам
+  esp_now_send(beacon[0], (uint8_t *)&packet, sizeof(packet));
+  delay(300);
+  packet.master_time = esp_timer_get_time();
+  esp_now_send(beacon[1], (uint8_t *)&packet, sizeof(packet));
+  delay(300);
+  packet.master_time = esp_timer_get_time();
+  esp_now_send(beacon[2], (uint8_t *)&packet, sizeof(packet));
+  delay(300);
+  time_synced = 1;
+  switchToSignal();
+}
+
+
+
+Result calcIteration3(float t0, float t1, float t2, float t3) {
+  float d1 = (t1 - t0) * SOUNDSPEED;
+  float d2 = (t2 - t0) * SOUNDSPEED;
+  float d3 = (t3 - t0) * SOUNDSPEED;
+
+  // Вычисление полупериметров
+  float p1 = (SIDE + d1 + d2) / 2.0f;
+  float p2 = (SIDE + d2 + d3) / 2.0f;
+
+  // Безопасное вычисление площадей
+  float s1 = 0.0f;
+  float term1 = p1 * (p1 - d1) * (p1 - d2) * (p1 - SIDE);
+  if (term1 >= 0) {
+    s1 = sqrt(term1);
+  } else {
+    return { 0, 0, 0.0f };
+  }
+  float s2 = 0.0f;
+  float term2 = p2 * (p2 - d2) * (p2 - d3) * (p2 - SIDE);
+  if (term2 >= 0) {
+    s2 = sqrt(term2);
+  } else {
+    return { 0, 0, 0.0f };
+  }
+  float h1 = 2 * s1 / SIDE;
+  float h2 = 2 * s2 / SIDE;
+
+  float check = sqrt(h1 * h1 + h2 * h2) - d2;
+
+  if (h1 > 0 && h2 > 0 && h1 < SIDE && h2 < SIDE && fabs(check) < 50) {
+    return { static_cast<int>(round(h1)),
+             static_cast<int>(round(h2)),
+             check };
+  }
+  return { 0, 0, 0.0f };
+}
+
+Result calc3(float t1, float t2, float t3) {
+  float t0 = fminf(t1, fminf(t2, t3)) - 2100;
+  float maxt = fmaxf(t1, fmaxf(t2, t3));
+  Result best = { 0, 0, 0.0f };
+
+  for (int i = 0; i < MAX_ITERATION && t0 < maxt; i++, t0 += 1) {
+    Result current = calcIteration3(t0, t1, t2, t3);
+    if (current.x == 0) continue;
+
+    if (best.x == 0 || fabs(current.check) < fabs(best.check)) {
+      best = current;
+    } else if (best.x != 0 && fabs(current.check) > fabs(best.check)) {
+      break;
+    }
+  }
+  return best;
+}
+
+void calculateCoordinates(float t1, float t2, float t3, float t4, float &x, float &y) {
+  float results[4][2] = { 0 };
+  int count = 0;
+
+  // Обработка четырех комбинаций датчиков
+  if (Result res = calc3(t1, t2, t3); res.x != 0) {
+    results[count][0] = res.x;
+    results[count][1] = SIDE - res.y;
+    count++;
+  }
+  if (Result res = calc3(t2, t3, t4); res.x != 0) {
+    results[count][0] = SIDE - res.y;
+    results[count][1] = SIDE - res.x;
+    count++;
+  }
+  if (Result res = calc3(t3, t4, t1); res.x != 0) {
+    results[count][0] = SIDE - res.x;
+    results[count][1] = res.y;
+    count++;
+  }
+  if (Result res = calc3(t4, t1, t2); res.x != 0) {
+    results[count][0] = res.y;
+    results[count][1] = res.x;
+    count++;
+  }
+
+  // Усреднение результатов
+  if (count > 0) {
+    float sumX = 0, sumY = 0;
+    for (int i = 0; i < count; i++) {
+      sumX += results[i][0];
+      sumY += results[i][1];
+    }
+    x = sumX / count;
+    y = sumY / count;
+  } else {
+    x = y = 0;
+  }
+}
+void convertCoordinates(float x, float y, char &ax, int &ay) {
+  // Вычисляем индексы с округлением и проверкой границ
+  int index = constrain(static_cast<int>(round(x / 50.0f)) - 1, 0, 7);
+  ax = cx[index];
+
+  index = constrain(static_cast<int>(round(y / 50.0f)) - 1, 0, 7);
+  ay = cy[index];
 }
